@@ -1,0 +1,168 @@
+name: Preview Comment
+description: Post or update the final Selflify preview comment for a pull request.
+
+inputs:
+  github-token:
+    required: true
+    description: GitHub token used to collect job info and publish the comment.
+  pr-number:
+    required: true
+    description: Pull request number.
+  path-name:
+    required: true
+    description: Preview path name.
+  preview-base-domain:
+    required: true
+    description: Base domain used by Selflify, for example example.dev.
+  comment-identifier:
+    required: false
+    description: Stable preview comment identifier.
+    default: preview-deploy
+  metadata-dir:
+    required: false
+    description: Directory with downloaded preview metadata artifacts.
+    default: preview-metadata
+
+runs:
+  using: composite
+  steps:
+    - name: Post final preview comment
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+
+          const issueNumber = Number('${{ inputs.pr-number }}');
+          const pathName = '${{ inputs.path-name }}';
+          const previewBaseDomain = '${{ inputs.preview-base-domain }}';
+          const metadataDir = path.join(process.env.GITHUB_WORKSPACE, '${{ inputs.metadata-dir }}');
+          const identifier = '${{ inputs.comment-identifier }}';
+          const marker = `<!-- selflify-preview-comment:${identifier} -->`;
+
+          const metadataBySite = new Map();
+          if (fs.existsSync(metadataDir)) {
+            for (const fileName of fs.readdirSync(metadataDir)) {
+              if (!fileName.endsWith('.json')) continue;
+
+              const filePath = path.join(metadataDir, fileName);
+              const metadata = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+              metadataBySite.set(metadata.site, metadata);
+            }
+          }
+
+          const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            run_id: context.runId,
+            filter: 'latest',
+            per_page: 100,
+          });
+
+          const deployJobsBySite = new Map(
+            jobs
+              .filter(job => job.name.startsWith('Deploy '))
+              .map(job => [job.name.replace(/^Deploy /, ''), job])
+          );
+
+          const sites = Array.from(
+            new Set([...metadataBySite.keys(), ...deployJobsBySite.keys()])
+          ).sort((left, right) => left.localeCompare(right));
+
+          const getStatusPresentation = conclusion => {
+            switch (conclusion) {
+              case 'success':
+                return { emoji: '✅', label: 'Success' };
+              case 'failure':
+                return { emoji: '❌', label: 'Failed' };
+              case 'timed_out':
+                return { emoji: '⏱️', label: 'Timed out' };
+              case 'cancelled':
+                return { emoji: '⏹️', label: 'Cancelled' };
+              case 'skipped':
+                return { emoji: '⚪', label: 'Skipped' };
+              case 'neutral':
+                return { emoji: '⚪', label: 'Neutral' };
+              default:
+                return { emoji: '❔', label: conclusion ?? 'Unknown' };
+            }
+          };
+
+          const formatDuration = seconds => {
+            if (typeof seconds !== 'number' || Number.isNaN(seconds) || seconds < 0) {
+              return '—';
+            }
+
+            if (seconds < 60) {
+              return `${seconds}s`;
+            }
+
+            const minutes = Math.floor(seconds / 60);
+            const remainingSeconds = seconds % 60;
+
+            if (minutes < 60) {
+              return remainingSeconds ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+            }
+
+            const hours = Math.floor(minutes / 60);
+            const remainingMinutes = minutes % 60;
+            return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+          };
+
+          const rows = sites.length === 0
+            ? '| ⚪ Skipped | — | — | — | — |'
+            : sites.map(site => {
+                const metadata = metadataBySite.get(site) ?? {
+                  preview_url: `https://${pathName}.${site}.${previewBaseDomain}`,
+                  build_duration_seconds: null,
+                };
+                const job = deployJobsBySite.get(site);
+                const conclusion = job?.conclusion ?? 'skipped';
+                const { emoji, label } = getStatusPresentation(conclusion);
+                const preview = conclusion === 'success' ? `[Open](${metadata.preview_url})` : '—';
+                const logs = job?.html_url ? `[View logs](${job.html_url})` : '—';
+                const duration = formatDuration(metadata.build_duration_seconds);
+
+                return `| ${emoji} ${label} | ${site} | ${preview} | ${logs} | ${duration} |`;
+              }).join('\n');
+
+          const body = [
+            marker,
+            '## Preview Deploy',
+            '',
+            `Path: \`${pathName}\``,
+            `Commit: \`${context.sha.slice(0, 7)}\``,
+            '',
+            '| Status | Site | Preview | Logs | Build time |',
+            '| --- | --- | --- | --- | --- |',
+            rows,
+            '',
+            '_This comment is updated automatically on new pushes._',
+          ].join('\n');
+
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: issueNumber,
+            per_page: 100,
+          });
+
+          const existingComment = comments.find(comment => comment.body?.includes(marker));
+
+          if (existingComment) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existingComment.id,
+              body,
+            });
+            return;
+          }
+
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: issueNumber,
+            body,
+          });
